@@ -1,7 +1,5 @@
 
 
-USE PURI
-GO
 
 
 CREATE OR ALTER    PROCEDURE		dbo.usp_CascadingDeletes
