@@ -9,7 +9,7 @@ AS
 
 
 /* ***************************************************************************************
-AUTHOR:	        Yasmin Udaipurwala
+AUTHOR:	        Yasmin U
 DATE:	        9/1/2025
 DESCRIPTION:	THIS PROC WILL  TAKE THE STAGE TABLE AS AN INPUT PARAM AND WILL
 				DYNAMICALLY DISABLE THE FOREIGN KEYS, DELETE THE RECORDS FROM  ALL AFFFECTED
