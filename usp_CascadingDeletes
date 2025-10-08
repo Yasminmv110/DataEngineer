@@ -1,0 +1,451 @@
+
+
+USE PURI
+GO
+
+
+CREATE OR ALTER    PROCEDURE		dbo.usp_CascadingDeletes
+								@Stage_Table NVARCHAR(100)---this value should always be supplied
+					
+AS
+
+
+/* ***************************************************************************************
+AUTHOR:	        Yasmin Udaipurwala
+DATE:	        9/1/2025
+DESCRIPTION:	THIS PROC WILL  TAKE THE STAGE TABLE AS AN INPUT PARAM AND WILL
+				DYNAMICALLY DISABLE THE FOREIGN KEYS, DELETE THE RECORDS FROM  ALL AFFFECTED
+				PROD TABLES AND THEN ENABLE THE FOREIGN KEYS.
+
+*******************************************************************************************/
+
+---first find all tables that have customer id and email id---tier 1
+--then find the pk of this table and find out if this pk is a fk in any other table.
+---if yes, then delete from the fk -i.e. child table first before deleting from parent table.
+
+
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET NOCOUNT ON;
+
+----FIRST RAISEERROR IF STAGE TABLE (THAT IS ENTERED AS PARAM) DOES NOT EXISTS IN STAGING DB
+
+----DECLARE @Stage_Table NVARCHAR(100) = 'Stage_DeleteCustomers'
+
+IF NOT EXISTS  (SELECT		1
+				FROM		 Staging.sys.tables  AS tab
+				WHERE		tab.name = @Stage_Table
+				)
+BEGIN
+    RAISERROR('USE Staging table. You Supplied An Invalid @Stage_Table Parameter %s', 16, 1, @Stage_Table);
+    RETURN;
+END;
+
+----THEN CHECK IF THE CUSTOMER_ID / EMAIL_ID COLUMNS EXISTS
+
+IF NOT EXISTS  (SELECT		1
+				FROM		Staging.sys.columns  AS col
+				INNER JOIN  Staging.sys.tables  AS tab
+				ON			col.object_id = tab.object_id
+				WHERE		tab.name = @Stage_Table
+							AND col.name IN ('Customer_Id', 'Email_Id')
+				)
+BEGIN
+    RAISERROR('The Customer_Id or Email_Id columns do not exist in  %s', 16, 1, @Stage_Table);
+    RETURN;
+END;
+
+
+
+/**************************
+DECLARE ALL THE VARIABLES
+*************************/
+
+
+DECLARE  @SQL  NVARCHAR(MAX)
+		,@Tab_Nm NVARCHAR(100)
+		,@Ref_Tab_Nm NVARCHAR(100)
+	    ,@StageTab_Nm NVARCHAR(100) 
+		,@Key_Nm NVARCHAR(100)	
+		,@Col_Nm NVARCHAR(100)
+		,@Ref_Col_Nm NVARCHAR(100);
+
+
+DROP TABLE IF EXISTS	#References;
+CREATE TABLE		#References
+					(
+					Tier_No TINYINT NOT NULL,
+					Table_Nm VARCHAR(100),
+					Column_Nm VARCHAR(100),
+					ReferenceTable_Nm VARCHAR(100),
+					ReferenceColumn_Nm VARCHAR(100),
+					Key_Type CHAR(2),
+					Key_Nm VARCHAR(255)
+					);
+
+/*odd tiers should be PK and even tiers should be FK*/
+INSERT INTO			#References
+					(Tier_No,
+					 Table_Nm,
+					 Column_Nm,
+					 Key_Type,
+					 Key_Nm
+					 )
+SELECT				1,
+					KCU.TABLE_NAME,
+					KCU.COLUMN_NAME,
+					'PK',
+					TC.CONSTRAINT_NAME
+FROM				INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS KCU
+INNER JOIN			INFORMATION_SCHEMA.TABLE_CONSTRAINTS  AS TC
+ON					TC.CONSTRAINT_NAME = KCU.CONSTRAINT_NAME
+WHERE				TC.CONSTRAINT_TYPE = 'PRIMARY KEY'
+					----AND kcu.COLUMN_NAME = 'Email_Id' AND KCU.TABLE_NAME = 'COMN_Email'
+					AND ((KCU.COLUMN_NAME = 'Email_Id' AND KCU.TABLE_NAME = 'Email')
+					    OR (KCU.COLUMN_NAME = 'Customer_Id' AND KCU.TABLE_NAME IN  ('Customer','Email')));
+
+--select		*
+--from		#References
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+DECLARE			@Tier_no TINYINT = 2,
+				@Row_ct INT = 1;
+
+WHILE @Row_ct>0
+BEGIN
+	
+INSERT INTO			#References
+					(Tier_No,
+		             Table_Nm,
+		             Column_Nm,
+		             ReferenceTable_Nm,
+		             ReferenceColumn_Nm,
+		             Key_Type,
+		             Key_Nm
+					 )
+SELECT				@Tier_no,				/*ALL FK WILL BE EVEN NUMBER TIERS.  THIS IS IMPORTANT LATER ON*/
+					t.name,
+					c.name,
+					t2.name,
+					c2.name,
+					'FK',
+					OBJECT_NAME(fkc.constraint_object_id)
+FROM				sys.foreign_key_columns AS fkc
+INNER JOIN			sys.tables t 
+ON					fkc.parent_object_id = t.object_id
+INNER JOIN			sys.columns c 
+ON					fkc.parent_object_id = c.object_id	
+					AND fkc.parent_column_id = c.column_id
+INNER JOIN			sys.tables t2 
+ON					fkc.referenced_object_id = t2.object_id
+INNER JOIN			sys.columns c2 
+ON					fkc.referenced_object_id = c2.object_id	
+					AND fkc.referenced_column_id = c2.column_id
+INNER JOIN			#References r 
+ON					t2.name = r.Table_Nm
+					AND c2.name = r.Column_Nm
+					AND r.Key_Type = 'PK'
+WHERE				NOT EXISTS (SELECT 1 FROM #References 
+								WHERE Key_Nm = OBJECT_NAME(fkc.constraint_object_id)  
+									AND Key_Type='FK');
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+SET @Row_ct = @@ROWCOUNT;
+SET @Tier_no = @Tier_no+1;
+
+	/*now go back and get the primary keys for any table that was a foreign key so that we are sure to do cascading deletes*/
+INSERT INTO		#References
+				(Tier_No,
+				 Table_Nm,
+				 Column_Nm,
+				 Key_Type,
+				 Key_Nm
+				 )
+SELECT			@Tier_no,		
+				kcu.TABLE_NAME,
+				kcu.COLUMN_NAME,
+				'PK',
+				tc.CONSTRAINT_NAME
+FROM			INFORMATION_SCHEMA.KEY_COLUMN_USAGE  AS kcu
+INNER JOIN		INFORMATION_SCHEMA.TABLE_CONSTRAINTS  AS tc 
+ON				tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+INNER JOIN		#References r ON kcu.TABLE_NAME = r.Table_Nm
+				AND r.Key_Type = 'FK'
+WHERE			NOT EXISTS (SELECT 1 FROM #References WHERE tc.CONSTRAINT_NAME = Key_Nm AND Key_Type = 'PK')
+			    AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY';
+
+SET @Tier_no = @Tier_no+1;
+
+END;
+
+--SELECT * FROM #References
+--ORDER BY tier_no
+
+/* from here the easiest thing to do should be to :
+1. disable all FK
+2. delete top tier PK.
+3. Start deleting from EVEN Tiers (FK) in order using where not exists, i.e.
+	DELETE from Child_Table where NOT EXISTS (select 1 from Parent_Table where email_id = email_id)
+4. Enable Keys
+*/
+
+
+--DECLARE  @SQL  NVARCHAR(MAX)
+--		,@Tab_Nm NVARCHAR(100)
+--		,@Ref_Tab_Nm NVARCHAR(100)
+--		,@Key_Nm NVARCHAR(100)	
+--		,@Col_Nm NVARCHAR(100)
+--		,@Ref_Col_Nm NVARCHAR(100)
+
+
+
+----1.DISABLE ALL THE FK
+DROP TABLE IF EXISTS #Disable_FK;
+
+CREATE TABLE		#Disable_FK			
+					(Tier_No TINYINT NOT NULL,
+					 Table_Nm VARCHAR(100),
+					 Key_Nm VARCHAR(255)
+					 );
+
+INSERT INTO			#Disable_FK
+SELECT				Tier_No
+					,Table_Nm
+					,Key_Nm
+FROM				#References 
+WHERE				Tier_No%2 = 0;----INSERT ONLY EVEN NUMBER TIERS I.E. FK 
+
+--SELECT		*
+--FROM		 #Disable_FK
+	
+WHILE EXISTS (SELECT 1  FROM	#Disable_FK)
+
+BEGIN
+SELECT		 TOP 1 
+			 @Tab_Nm = Table_Nm
+			,@Key_Nm = Key_Nm
+FROM		#Disable_FK;
+
+SET @SQL = (SELECT 'ALTER TABLE '+ @Tab_Nm +' NOCHECK CONSTRAINT '+ @Key_Nm    
+			);
+
+EXEC sys.sp_executesql @stmt = @SQL ;
+
+DELETE FROM			#Disable_FK
+WHERE				Table_Nm = @Tab_Nm
+					AND Key_Nm =  @Key_Nm;
+
+END;
+
+--select		*
+--from		sys.foreign_keys
+--where is_disabled = 1
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+--SELECT * FROM Stage_DeleteCustomers
+
+/*2.DELETE TOP TIER  PK.*/
+
+DROP TABLE IF EXISTS	#DeleteTopTier_PK;
+CREATE TABLE		#DeleteTopTier_PK
+					(
+					Tier_No TINYINT NOT NULL,
+					Table_Nm VARCHAR(100),
+					Column_Nm VARCHAR(100),
+					Key_Type CHAR(2),
+					Key_Nm VARCHAR(255)
+					);
+
+
+INSERT INTO			#DeleteTopTier_PK
+SELECT				Tier_No 
+					,Table_Nm 
+					,Column_Nm
+         			,Key_Type 
+					,Key_Nm 
+FROM				#References
+WHERE				Tier_No = 1
+					AND   Key_Type = 'PK';     ----INSERT ONLY ODD NUMBER I.E.PRIMARY KEY
+
+--SELECT		*
+--FROM		#DeleteTopTier_PK
+
+--DECLARE  @SQL  NVARCHAR(MAX)
+--		,@Tab_Nm NVARCHAR(100)
+--		,@Col_Nm NVARCHAR(100)
+--		,@StageTab_Nm NVARCHAR(100) 
+
+WHILE EXISTS (SELECT 1  FROM	#DeleteTopTier_PK)
+
+BEGIN
+SELECT		 TOP 1 
+			 @Tab_Nm = Table_Nm
+			,@Col_Nm = Column_Nm
+		    ,@StageTab_Nm = @Stage_Table --- 'Stage_DeleteCustomers'---INPUT PARAM
+FROM		#DeleteTopTier_PK;
+
+SET @SQL = ('DELETE CE FROM '+@Tab_Nm+' AS CE WHERE EXISTS (SELECT 1 FROM  Staging.dbo.' +@StageTab_Nm+ ' AS del WHERE ce.'+@Col_Nm+' = del.'+@Col_Nm+')' 
+			);			
+
+EXEC sys.sp_executesql @stmt = @SQL ;
+
+DELETE FROM		#DeleteTopTier_PK
+WHERE			@Tab_Nm = Table_Nm
+			    AND @Col_Nm = Column_Nm
+				AND @StageTab_Nm =  @Stage_Table;---INPUT PARAM
+END;
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/*3. Start deleting from EVEN Tiers (FK) in order using where not existS*/
+
+
+DROP TABLE IF EXISTS	#DeleteEvenTier_FK;
+
+CREATE TABLE		#DeleteEvenTier_FK
+					(
+					Tier_No TINYINT NOT NULL,
+					Table_Nm VARCHAR(100),
+					Column_Nm VARCHAR(100),
+					ReferenceTable_Nm VARCHAR(100),
+					ReferenceColumn_Nm VARCHAR(100),
+					);
+
+
+INSERT INTO			#DeleteEvenTier_FK
+SELECT				Tier_No
+					,Table_Nm 
+					,Column_Nm 
+					,ReferenceTable_Nm
+					,ReferenceColumn_Nm
+FROM				#References 
+WHERE				Tier_No%2=0;----INSERT ONLY EVEN NUMBER TIERS I.E. FK 
+
+SELECT		*
+FROM		#DeleteEvenTier_FK
+
+
+WHILE EXISTS (SELECT 1  FROM	#DeleteEvenTier_FK)
+
+BEGIN
+SELECT		 TOP 1 
+			 @Tab_Nm= Table_Nm
+		    ,@Col_Nm = Column_Nm
+		    ,@Ref_Tab_Nm = ReferenceTable_Nm
+		    ,@Ref_Col_Nm= ReferenceColumn_Nm
+FROM		#DeleteEvenTier_FK;
+
+
+SET @SQL =('DELETE del FROM '+@Tab_Nm+' AS del WHERE NOT EXISTS (SELECT 1 FROM ' +@Ref_Tab_Nm+ '  AS REF WHERE del.'+@Col_Nm+' = REF.'+ @Ref_Col_Nm+') AND del.'+@Col_Nm+' IS NOT NULL'				
+			);
+----PRINT @SQL
+
+EXEC sys.sp_executesql @stmt = @SQL ;
+
+DELETE FROM		#DeleteEvenTier_FK
+WHERE		    @Tab_Nm= Table_Nm
+			AND @Col_Nm = Column_Nm
+			AND @Ref_Tab_Nm = ReferenceTable_Nm
+			AND @Ref_Col_Nm= ReferenceColumn_Nm;
+END;
+
+----EXAMPLE
+----DELETE		del 
+----FROM		Child_Table AS del
+----WHERE		NOT EXISTS (SELECT 1 FROM Parent_Table  AS REF 
+----						WHERE del.Email_Id = REF.Email_Id)
+----			AND del.Email_Id IS NOT NULL
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/*4. Enable  Keys*/
+
+DROP TABLE IF EXISTS #Enable_FK;
+
+CREATE TABLE		 #Enable_FK			
+					(Tier_No TINYINT NOT NULL,
+					 Table_Nm VARCHAR(100),
+					 Key_Nm VARCHAR(255)
+					 );
+
+INSERT INTO			 #Enable_FK
+SELECT				Tier_No
+					,Table_Nm
+					,Key_Nm
+FROM				#References 
+WHERE				Tier_No%2=0;----INSERT ONLY EVEN NUMBER TIERS I.E. FK 
+
+--SELECT		*
+--FROM		 #Enable_FK
+
+--DECLARE  @SQL  NVARCHAR(MAX)
+--		,@Tab_Nm NVARCHAR(100)
+--		,@key_Nm NVARCHAR(100)
+
+WHILE EXISTS (SELECT 1  FROM	 #Enable_FK)
+
+BEGIN
+SELECT		 TOP 1 
+			 @Tab_Nm = Table_Nm
+			,@Key_Nm = Key_Nm
+FROM		 #Enable_FK;
+
+SET @SQL = (SELECT 'ALTER TABLE '+ @Tab_Nm +' WITH CHECK CHECK CONSTRAINT '+ @Key_Nm    ----AS [ENABLE CONSTRAINTS]
+		----	FROM #Temp
+		);
+----print  @SQL
+
+EXEC sys.sp_executesql @stmt = @SQL ;
+
+DELETE FROM  #Enable_FK
+WHERE Table_Nm = @Tab_Nm
+AND Key_Nm =  @Key_Nm;
+
+END;
+
+--select		*
+--from		sys.foreign_keys
+--where is_disabled = 1
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/*******************************************************************
+	RAISE ERROR - IF Customer_Id or Email_Id Exists in PROD Tables
+********************************************************************/
+IF EXISTS 
+(
+SELECT		TOP 1 C.Customer_Id
+FROM		dbo.Customer as C
+INNER JOIN  Stage_DeleteCustomers AS S
+ON			s.Customer_Id = C.Customer_Id
+)
+
+BEGIN
+		RAISERROR('One or more Customer_Id still exists in Customer', 16, 1);
+		RETURN;
+END
+
+
+IF EXISTS 
+(
+SELECT		TOP 1 E.Email_Id
+FROM		dbo.Email AS E
+INNER JOIN	Stage_DeleteCustomers AS S
+ON			S.Email_Id = E.Email_Id			
+)
+	
+BEGIN
+		RAISERROR('One or more Email_Id still exists in Email', 16, 1);
+		RETURN;
+END
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+---- TRUNCATE THE STAGE TABLE AT THE END IF NO RECORDS EXISTS IN PROD TABLES
+
+----DECLARE  @SQL  NVARCHAR(MAX)
+----		,@Stage_Table NVARCHAR(100) = 'DeleteCustomers'
+
+SET @SQL = (SELECT 'TRUNCATE TABLE Staging.dbo.' + @Stage_Table)
+
+EXEC sys.sp_executesql @stmt = @SQL ;
+
+
+
